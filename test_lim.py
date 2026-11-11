@@ -633,7 +633,12 @@ def validate_semantic_intent_against_question(semantic_intent, question):
             r"\b(?:top|bottom)\s+\d+\s+"
             r"(?:gold\s+|silver\s+|standard\s+|premium\s+|north\s+|south\s+|east\s+|west\s+)*"
             r"(?:purchases?|orders?|transactions?|records?|items?|rows?)\b",
-            question_lower,
+            question_lower_for_mode,
+        )
+        or re.search(
+            r"\b\d+\s+(?:purchases?|orders?|transactions?|records?|items?|rows?)"
+            r".{0,60}\b(?:highest|lowest|largest|smallest|most|least)\b",
+            question_lower_for_mode,
         )
     )
 
@@ -1766,6 +1771,7 @@ def map_semantic_intent_to_requirements(
             metric_keywords = {
                 "value": ["Purchase_Value", "Amount", "Revenue", "Value"],
                 "amount": ["Amount", "Purchase_Value", "Revenue"],
+                "sales": ["Sales_Amount", "Sales", "Revenue", "Amount"],
                 "revenue": ["Revenue", "Amount", "Purchase_Value"],
                 "price": ["Price", "Amount", "Purchase_Value"],
                 "score": ["Score", "Performance_Score"],
