@@ -2605,10 +2605,8 @@ def validate_plan(plan_steps, tables):
 plan_errors = validate_plan(plan_steps, tables)
 
 if plan_errors:
-    print("\n================ PLAN ERRORS ================\n")
-    for error in plan_errors:
-        print("[ERROR]", str(error))
-    raise ValueError("Invalid execution plan.")
+    error_message = " | ".join(str(error) for error in plan_errors)
+    raise ValueError(f"Invalid execution plan: {error_message}")
 
 print("\n================ PLAN VALID ================\n")
 
