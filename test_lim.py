@@ -600,7 +600,16 @@ def validate_semantic_intent_against_question(semantic_intent, question):
     # Deterministic ranking and LIMIT from ORIGINAL QUESTION.
     # ------------------------------------------------------------
     limit_match = re.search(r"\b(top|bottom)\s+(\d+)\b", question_lower)
-    limit = int(limit_match.group(2)) if limit_match else None
+    reverse_limit_match = re.search(
+        r"\b(\d+)\s+(?:purchases?|orders?|transactions?|records?|items?|rows?)"
+        r".{0,60}\b(?:highest|lowest|largest|smallest)\b",
+        question_lower,
+    )
+    limit = (
+        int(limit_match.group(2)) if limit_match
+        else int(reverse_limit_match.group(1)) if reverse_limit_match
+        else None
+    )
 
     if re.search(r"\bbottom\s+\d+\b", question_lower):
         rank = "lowest"
@@ -628,6 +637,9 @@ def validate_semantic_intent_against_question(semantic_intent, question):
     # ------------------------------------------------------------
     # RAW top/bottom detection.
     # ------------------------------------------------------------
+
+    question_lower_for_mode = question.lower().strip()
+        
     raw_top_bottom = bool(
         re.search(
             r"\b(?:top|bottom)\s+\d+\s+"
@@ -1718,8 +1730,15 @@ def map_semantic_intent_to_requirements(
         r"\b(?:top|bottom)\s+(\d+)\b",
         question_lower,
     )
+    reverse_limit_match = re.search(
+        r"\b(\d+)\s+(?:purchases?|orders?|transactions?|records?|items?|rows?)"
+        r".{0,60}\b(?:highest|lowest|largest|smallest)\b",
+        question_lower,
+    )
     requirements["limit"] = (
-        int(limit_match.group(1)) if limit_match else None
+        int(limit_match.group(1)) if limit_match
+        else int(reverse_limit_match.group(1)) if reverse_limit_match
+        else None
     )
 
     # Original question is authoritative for raw top/bottom queries.
@@ -1730,6 +1749,11 @@ def map_semantic_intent_to_requirements(
         re.search(
             r"\b(?:top|bottom)\s+\d+\s+(?:gold\s+|silver\s+|standard\s+|premium\s+|north\s+|south\s+|east\s+|west\s+)*"
             r"(?:purchases?|orders?|transactions?|records?|items?|rows?)\b",
+            question_lower_for_mode,
+        )
+        or re.search(
+            r"\b\d+\s+(?:purchases?|orders?|transactions?|records?|items?|rows?)"
+            r".{0,60}\b(?:highest|lowest|largest|smallest)\b",
             question_lower_for_mode,
         )
     )
@@ -1743,7 +1767,10 @@ def map_semantic_intent_to_requirements(
 
         # Raw top/bottom queries still need a sort direction and limit.
         if raw_top_bottom:
-            if re.search(r"\bbottom\s+\d+\b", question_lower_for_mode):
+            if re.search(r"\bbottom\s+\d+\b", question_lower_for_mode) or re.search(
+                r"\b\d+\s+(?:purchases?|orders?|transactions?|records?|items?|rows?).{0,60}\b(?:lowest|smallest)\b",
+                question_lower_for_mode,
+            ):
                 requirements["order"] = "asc"
             else:
                 requirements["order"] = "desc"
@@ -2994,6 +3021,31 @@ final_result = execute_plan(
     plan_steps,
     tables,
 )
+
+# RAW TOP/BOTTOM N: sort source records directly (no GROUP BY).
+if requirements.get("result_type") == "list" and requirements.get("limit") is not None:
+    _raw_sort_column = requirements.get("sort_column")
+    if not _raw_sort_column or _raw_sort_column not in final_result.columns:
+        raise ValueError(
+            "Could not identify a valid numeric sort column for this top/bottom records query."
+        )
+    _raw_sort_values = pd.to_numeric(final_result[_raw_sort_column], errors="coerce")
+    final_result = (
+        final_result.assign(__raw_sort_value__=_raw_sort_values)
+        .dropna(subset=["__raw_sort_value__"])
+        .sort_values(
+            "__raw_sort_value__",
+            ascending=(requirements.get("order") == "asc"),
+            kind="stable",
+        )
+        .head(requirements["limit"])
+        .drop(columns=["__raw_sort_value__"])
+        .reset_index(drop=True)
+    )
+    print(
+        f"\\nRAW TOP/BOTTOM RESULT: {len(final_result)} rows "
+        f"sorted by {_raw_sort_column} ({requirements.get('order')})"
+    )
 
 
 # ------------------------------------------------------------
