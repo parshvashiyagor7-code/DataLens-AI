@@ -16,11 +16,26 @@ import subprocess
 import streamlit as st
 
 import pandas as pd
+import hashlib
+from types import SimpleNamespace
 
 from datalens_ui import apply_brand_theme, record_analysis, page_header, stat_cards, apply_chart_style, chip
+from analysis_service import parse_engine_output, validate_analysis_payload
+from app import validate_dataset_tables, build_schema_context
 
 
 
+
+
+
+
+@st.cache_data(show_spinner=False, max_entries=32)
+def _read_uploaded_table(file_name, file_bytes):
+    """Parse uploaded data with content-addressed Streamlit caching."""
+    import io
+    if file_name.lower().endswith(".csv"):
+        return pd.read_csv(io.BytesIO(file_bytes))
+    return pd.read_excel(io.BytesIO(file_bytes))
 
 
 st.set_page_config(
@@ -99,13 +114,8 @@ if uploaded_files:
 
 
 
-            if uploaded_file.name.lower().endswith(".csv"):
-
-                df = pd.read_csv(uploaded_file)
-
-            else:
-
-                df = pd.read_excel(uploaded_file)
+            file_bytes = uploaded_file.getvalue()
+            df = _read_uploaded_table(uploaded_file.name, file_bytes)
 
 
 
@@ -141,7 +151,28 @@ if uploaded_files:
 
     if dataframes:
 
-
+        # Phase 5: inspect uploaded schemas and flag data-quality risks early.
+        _dataset_issues = validate_dataset_tables(dataframes)
+        _blocking_issues = [
+            issue for issue in _dataset_issues
+            if "no data rows" in issue.lower() or "no columns" in issue.lower()
+        ]
+        if _dataset_issues:
+            with st.expander(f"Data quality checks ({len(_dataset_issues)} finding(s))", expanded=bool(_blocking_issues)):
+                for _issue in _dataset_issues:
+                    if _issue in _blocking_issues:
+                        st.error(_issue)
+                    else:
+                        st.warning(_issue)
+        _schema_context = build_schema_context(dataframes)
+        with st.expander("Dataset schema inspector", expanded=False):
+            for _table_name, _table_schema in _schema_context.items():
+                st.markdown(f"**{_table_name}** — {_table_schema['rows']:,} rows")
+                st.dataframe(
+                    pd.DataFrame(_table_schema["columns"]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
         st.markdown(chip(f"{len(dataframes)} dataset(s) loaded", "ok"), unsafe_allow_html=True)
 
@@ -311,9 +342,24 @@ if uploaded_files:
 
         )
 
+        # Bind cached output to the exact question and uploaded file contents.
+        _analysis_fingerprint = hashlib.sha256(
+            (
+                question.strip()
+                + "|"
+                + "|".join(
+                    f"{f.name}:{hashlib.sha256(f.getvalue()).hexdigest()}"
+                    for f in uploaded_files
+                )
+            ).encode("utf-8")
+        ).hexdigest()
 
+        has_matching_cached_output = (
+            st.session_state.get("analysis_fingerprint") == _analysis_fingerprint
+            and bool(st.session_state.get("analysis_output"))
+        )
 
-        if analyze_clicked:
+        if analyze_clicked or has_matching_cached_output:
 
 
 
@@ -322,6 +368,10 @@ if uploaded_files:
                 st.warning("Please enter a question.")
 
 
+
+            elif _blocking_issues:
+
+                st.error("Fix the blocking dataset issue(s) above before running an analysis.")
 
             else:
 
@@ -388,16 +438,47 @@ if uploaded_files:
 
 
                             env = os.environ.copy()
-                            try:
-                                gemini_api_key = st.secrets["GEMINI_API_KEY"]
-                            except Exception:
-                                gemini_api_key = os.environ.get("GEMINI_API_KEY")
 
-                            if not gemini_api_key:
-                                st.error("Gemini API key is not configured.")
+                            # Pass only the provider configuration needed by the
+                            # analysis subprocess. Secrets are never written to source files.
+                            provider_settings = (
+                                "AI_PROVIDER",
+                                "AI_PROVIDER_ORDER",
+                                "AI_REQUEST_TIMEOUT_SECONDS",
+                                "GEMINI_API_KEY",
+                                "GEMINI_MODEL",
+                                "GROQ_API_KEY",
+                                "GROQ_MODEL",
+                                "OLLAMA_BASE_URL",
+                                "OLLAMA_MODEL",
+                            )
+
+                            configured_provider_value = False
+                            for setting_name in provider_settings:
+                                setting_value = None
+                                try:
+                                    setting_value = st.secrets.get(setting_name)
+                                except Exception:
+                                    setting_value = None
+
+                                if setting_value is None or str(setting_value).strip() == "":
+                                    setting_value = os.environ.get(setting_name)
+
+                                if setting_value is not None and str(setting_value).strip() != "":
+                                    env[setting_name] = str(setting_value)
+                                    if setting_name in {"GEMINI_API_KEY", "GROQ_API_KEY"}:
+                                        configured_provider_value = True
+
+                            selected_provider = env.get("AI_PROVIDER", "auto").strip().lower()
+                            local_ollama_selected = selected_provider == "ollama"
+                            if not configured_provider_value and not local_ollama_selected:
+                                st.error(
+                                    "No cloud AI provider key is configured. Add GEMINI_API_KEY "
+                                    "or GROQ_API_KEY in Streamlit Secrets. For local development, "
+                                    "you can select AI_PROVIDER='ollama'."
+                                )
                                 st.stop()
 
-                            env["GEMINI_API_KEY"] = gemini_api_key
                             env["MPLBACKEND"] = "Agg"
 
 
@@ -408,30 +489,22 @@ if uploaded_files:
 
                             ):
 
-                                process = subprocess.run(
-
-                                    [sys.executable, engine_path],
-
-                                    input=(
-
-                                        f"{temp_dir}\n"
-
-                                        f"{question.strip()}\n"
-
-                                    ),
-
-                                    capture_output=True,
-
-                                    text=True,
-
-                                    cwd=project_dir,
-
-                                    env=env,
-
-                                    timeout=300
-
-                                )
-
+                                if analyze_clicked:
+                                    process = subprocess.run(
+                                        [sys.executable, engine_path],
+                                        input=f"{temp_dir}\n{question.strip()}\n",
+                                        capture_output=True,
+                                        text=True,
+                                        cwd=project_dir,
+                                        env=env,
+                                        timeout=300
+                                    )
+                                else:
+                                    process = SimpleNamespace(
+                                        returncode=0,
+                                        stdout=st.session_state["analysis_output"],
+                                        stderr=""
+                                    )
 
 
                         if process.returncode != 0:
@@ -461,6 +534,11 @@ if uploaded_files:
                         else:
 
                             output = process.stdout
+                            provider_match = re.search(r"\[DATALENS_AI_PROVIDER\]=([a-zA-Z0-9_-]+)", output)
+                            if provider_match:
+                                st.caption(f"AI provider used: {provider_match.group(1).title()}")
+                            st.session_state["analysis_output"] = output
+                            st.session_state["analysis_fingerprint"] = _analysis_fingerprint
 
                             result_marker = "__STREAMLIT_RESULT__"
 
@@ -476,13 +554,8 @@ if uploaded_files:
 
                             if result_marker in output:
 
-                                json_text = output.rsplit(
-                                    result_marker, 1
-                                )[1].strip()
-
-                                # Parse only the JSON line emitted by test_lim.py.
-                                json_line = json_text.splitlines()[0].strip()
-                                payload = json.loads(json_line)
+                                payload = parse_engine_output(output)
+                                payload = validate_analysis_payload(payload)
 
                                 # Some engine versions print CHART TYPE outside
                                 # the JSON payload. Recover it as a fallback.

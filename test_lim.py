@@ -4,18 +4,16 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import json
 import time
-from google.genai import errors
-from google import genai
-from google.genai import types
+from ai_providers.provider_manager import generate_text, get_last_provider
 
-from app import load_user_dataset, profile_data, TOOL_REGISTRY
+from app import load_user_dataset, profile_data, TOOL_REGISTRY, resolve_column_name, rank_numeric_columns
 
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-MODEL_NAME = "gemini-3.8-flash"
+# AI model selection is managed by ai_providers/provider_manager.py.
 
 
 # ============================================================
@@ -250,44 +248,29 @@ FINAL CHECK
 
 Return ONLY the semantic fields.
 """
-    api_key = os.environ.get("GEMINI_API_KEY")
+    # Provider selection and failover are centralized. The analysis engine
+    # consumes plain text and remains independent of the AI vendor.
+    response_text = generate_text(prompt)
+    print(f"[DATALENS_AI_PROVIDER]={get_last_provider()}")
+    return response_text
 
-    if not api_key:
-        raise RuntimeError(
-            "GEMINI_API_KEY is missing. "
-            "Configure it in Streamlit Secrets."
-        )
+try:
+    semantic_intent = extract_semantic_intent(question, profiles)
+except Exception as exc:
+    print(
+        "__STREAMLIT_RESULT__" +
+        json.dumps({
+            "status": "error",
+            "answer": "I could not interpret this question right now. Please try again in a moment.",
+            "error": f"{type(exc).__name__}: {exc}",
+            "result": [],
+            "columns": [],
+            "chart_type": "NONE",
+        }, default=str)
+    )
+    raise
 
-    client = genai.Client(api_key=api_key)
-
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0,
-                    max_output_tokens=300,
-                ),
-            )
-
-            if not response.text:
-                raise RuntimeError(
-                    "Gemini returned an empty semantic response."
-                )
-
-            return response.text.strip()
-
-        except errors.ServerError as e:
-            if e.code == 503 and attempt < 2:
-                print(f"Gemini overloaded. Retrying... ({attempt + 1}/3)")
-                time.sleep(5 * (attempt + 1))
-            else:
-                raise
-
-semantic_intent = extract_semantic_intent(question, profiles)
-
-print("\n================ SEMANTIC INTENT ================\n")
+print("\\n================ SEMANTIC INTENT ================\\n")
 print(semantic_intent)
 
 
@@ -1177,26 +1160,21 @@ print(validated_semantic_intent)
 # ============================================================
 
 def resolve_schema_column(name, tables):
-    """Resolve a semantic field to an actual existing schema column."""
-    if not name or str(name).lower() == "none":
+    """Resolve semantic column names against all loaded table schemas."""
+    if not name or str(name).strip().lower() == "none":
         return None
 
-    name_lower = str(name).strip().lower()
-
-    # Exact match first.
+    # Search each table independently. Exact/normalized/fuzzy resolution is
+    # centralized in app.py so every workflow uses the same policy.
+    matches = []
     for df in tables.values():
-        for column in df.columns:
-            if column.lower() == name_lower:
-                return column
+        resolved = resolve_column_name(name, df.columns)
+        if resolved is not None and resolved not in matches:
+            matches.append(resolved)
 
-    # Entity -> entity ID, e.g. Client -> Client_ID.
-    candidate = f"{name_lower}_id"
-    for df in tables.values():
-        for column in df.columns:
-            if column.lower() == candidate:
-                return column
-
-    return None
+    # If the same semantic request maps to different physical columns across
+    # tables, do not guess; downstream planning can report the unresolved name.
+    return matches[0] if len(matches) == 1 else None
 
 
 def tables_for_column(column, tables):
@@ -1795,39 +1773,13 @@ def map_semantic_intent_to_requirements(
         if requirements.get("value_column"):
             requirements["sort_column"] = requirements["value_column"]
         else:
-            metric_keywords = {
-                "value": ["Purchase_Value", "Amount", "Revenue", "Value"],
-                "amount": ["Amount", "Purchase_Value", "Revenue"],
-                "sales": ["Sales_Amount", "Sales", "Revenue", "Amount"],
-                "revenue": ["Revenue", "Amount", "Purchase_Value"],
-                "price": ["Price", "Amount", "Purchase_Value"],
-                "score": ["Score", "Performance_Score"],
-            }
-
-            numeric_columns = [
-                column
-                for df in tables.values()
-                for column in df.columns
-                if pd.api.types.is_numeric_dtype(df[column])
-            ]
-
-            for keyword, candidates in metric_keywords.items():
-                if re.search(rf"\b{re.escape(keyword)}\b", question_lower_for_mode):
-                    for candidate in candidates:
-                        for actual in numeric_columns:
-                            if actual.lower() == candidate.lower():
-                                requirements["sort_column"] = actual
-                                break
-                        if requirements["sort_column"]:
-                            break
-                if requirements["sort_column"]:
-                    break
-
-            if requirements["sort_column"] is None and numeric_columns:
-                # Avoid choosing units/count-like columns when a purchase value exists.
-                requirements["sort_column"] = (
-                    next((c for c in numeric_columns if c.lower() == "purchase_value"), numeric_columns[0])
-                )
+            # Select a sort metric from the actual numeric schema instead of
+            # relying on dataset-specific names such as Purchase_Value.
+            selected_metric, metric_confidence = rank_numeric_columns(
+                question_lower_for_mode, tables
+            )
+            if selected_metric is not None and metric_confidence >= 0.20:
+                requirements["sort_column"] = selected_metric
 
             if requirements.get("source_column") is None:
                 requirements["source_column"] = requirements.get("sort_column")
@@ -1837,7 +1789,7 @@ def map_semantic_intent_to_requirements(
     # purchases made by Gold clients, not Category=Gold, when the
     # dataset contains Client_Type.
     # ------------------------------------------------------------
-    if requirements.get("entity", "").strip().lower() == "purchase":
+    if str(requirements.get("entity") or "").strip().lower() == "purchase":
         all_columns = [column for df in tables.values() for column in df.columns]
         client_type_column = next(
             (c for c in all_columns if c.lower() == "client_type"),
@@ -3678,15 +3630,6 @@ if _region_category_requested and not final_result.empty:
 print("\n================ FINAL ANSWER ================\n")
 print(final_answer)
 
-print(
-    "__STREAMLIT_RESULT__" +
-    json.dumps({
-        "answer": str(final_answer),
-        "result": final_result.to_dict(orient="records"),
-        "columns": final_result.columns.tolist()
-    }, default=str)
-)
-
 print(final_result.columns)
 print(final_result.dtypes)
 print(final_result.shape)
@@ -4038,15 +3981,18 @@ def plot_histogram(result):
     plt.show()
 
 
-if chart_type == "BAR":
-    plot_bar_chart(final_result)
-elif chart_type == "LINE":
-    plot_line_chart(final_result)
-elif chart_type == "PIE":
-    plot_pie_chart(final_result)
-elif chart_type == "HISTOGRAM":
-    plot_histogram(final_result)
+# Chart rendering is owned by the Streamlit page. The engine only selects
+# chart_type and returns structured data, avoiding duplicate chart work.
 
-
-elif chart_type == "NONE":
-    print("No chart to display for this query.")
+# Emit the structured result only after chart selection and chart generation.
+# Keep this as the final machine-readable stdout record for the Streamlit page.
+print(
+    "__STREAMLIT_RESULT__" +
+    json.dumps({
+        "status": "success",
+        "answer": str(final_answer),
+        "result": final_result.to_dict(orient="records"),
+        "columns": final_result.columns.tolist(),
+        "chart_type": chart_type,
+    }, default=str)
+)
